@@ -1,2 +1,14 @@
 *.json
 logs/
+*.png
+
+.sports_live_probe_chrome/
+
+
+__pycache__/
+*.pyc
+
+
+_xk_page.html
+_official_xsxk.js
+_flexible-*.js

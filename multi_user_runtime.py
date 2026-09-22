@@ -67,6 +67,8 @@ class UserRuntimeContext:
         current_saved_list_dirty: 当前课程是否有未保存变化。
         search_results_by_task_id: 该用户最近一次查询结果映射。
         search_result_course_types_by_task_id: 查询结果的选课方式映射。
+        search_type_labels_by_code: 查询汇总中的选课方式展示名称映射。
+        search_academic_context: 查询结果对应的服务端学期上下文。
         course_attempts: 按课程任务 ID 保存的实时抢课状态。
     """
 
@@ -89,6 +91,8 @@ class UserRuntimeContext:
     current_saved_list_dirty: bool = False
     search_results_by_task_id: dict[str, Any] = field(default_factory=dict)
     search_result_course_types_by_task_id: dict[str, str] = field(default_factory=dict)
+    search_type_labels_by_code: dict[str, str] = field(default_factory=dict)
+    search_academic_context: dict[str, str] = field(default_factory=dict)
     course_attempts: dict[str, CourseAttemptState] = field(default_factory=dict)
 
 

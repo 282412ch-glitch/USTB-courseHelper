@@ -356,6 +356,123 @@ def test_add_selected_courses_stays_on_course_search_page(
     assert messages == [("成功", "已添加 1 门课程")]
 
 
+def test_add_selected_sports_course_keeps_dynamic_rule_code(
+    app_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证体育查询结果加入待抢列表时保留服务端实际选课方式代码。
+
+    Args:
+        app_module: 已加载的课程助手入口模块。
+        monkeypatch: pytest 提供的运行时替换工具。
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None: 通过断言验证抢课请求数据不会回退到静态体育代码。
+    """
+    store = UserProfileStore(tmp_path)
+    profile = store.create("[[USER_A]]")
+    app = _make_navigation_app(app_module)
+    app.profile_store = store
+    app.runtime = MultiUserRuntime(store)
+    app.runtime.select_profile(profile.id)
+    app.course_result_tree = FakeTree()
+    app.priority_var = FakeVariable()
+    app.priority_var.set("1")
+    app.semester_var = FakeVariable()
+    app.semester_var.set("2026-2027-1")
+    result = type(
+        "CourseResult",
+        (),
+        {
+            "task_id": "[[COURSE_TASK_ID]]",
+            "category_code": "[[SPORTS_CATEGORY]]",
+            "course_name": "[[SPORTS_COURSE_NAME]]",
+            "teacher": "[[TEACHER_NAME]]",
+            "course_code": "[[SPORTS_COURSE_CODE]]",
+            "schedule": "[[SCHEDULE]]",
+        },
+    )()
+    real_sports_code = "[[REAL_SPORTS_THREE_CODE]]"
+    app.search_results_by_task_id = {result.task_id: result}
+    app.search_result_course_types_by_task_id = {
+        result.task_id: real_sports_code
+    }
+    app.status_var = FakeVariable()
+    app.cache_course_info = lambda *args: None
+    app.mark_current_list_dirty = lambda: None
+    app.save_course_list = lambda: True
+    app.update_course_list = lambda: None
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *args: None)
+
+    app.add_selected_courses()
+
+    course_data = app.runtime.require_context(profile.id).courses[0]["data"]
+    assert course_data["p_xkfsdm"] == real_sports_code
+    assert course_data["p_kclb"] == "[[SPORTS_CATEGORY]]"
+
+
+def test_add_selected_sports_course_keeps_server_term_context(
+    app_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证体育课程待抢请求复用查询时的服务器学期上下文。"""
+    store = UserProfileStore(tmp_path)
+    profile = store.create("[[USER_A]]")
+    app = _make_navigation_app(app_module)
+    app.profile_store = store
+    app.runtime = MultiUserRuntime(store)
+    app.runtime.select_profile(profile.id)
+    app.course_result_tree = FakeTree()
+    app.priority_var = FakeVariable()
+    app.priority_var.set("1")
+    app.semester_var = FakeVariable()
+    app.semester_var.set("2025-2026-2")
+    result = type(
+        "CourseResult",
+        (),
+        {
+            "task_id": "[[COURSE_TASK_ID]]",
+            "category_code": "[[SPORTS_CATEGORY]]",
+            "course_name": "[[SPORTS_COURSE_NAME]]",
+            "teacher": "[[TEACHER_NAME]]",
+            "course_code": "[[SPORTS_COURSE_CODE]]",
+            "schedule": "[[SCHEDULE]]",
+        },
+    )()
+    server_context = {
+        "p_xn": "2026-2027",
+        "p_xq": "1",
+        "p_xnxq": "2026-20271",
+        "p_dqxn": "2026-2027",
+        "p_dqxq": "1",
+        "p_dqxnxq": "2026-20271",
+        "cxsfmt": "1",
+    }
+    app.runtime.require_context(profile.id).search_academic_context = server_context
+    app.search_results_by_task_id = {result.task_id: result}
+    app.search_result_course_types_by_task_id = {
+        result.task_id: "[[REAL_SPORTS_THREE_CODE]]"
+    }
+    app.status_var = FakeVariable()
+    app.cache_course_info = lambda *args: None
+    app.mark_current_list_dirty = lambda: None
+    app.save_course_list = lambda: True
+    app.update_course_list = lambda: None
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *args: None)
+
+    app.add_selected_courses()
+
+    request_data = app.runtime.require_context(profile.id).courses[0]["data"]
+    assert {name: request_data[name] for name in server_context} == server_context
+    assert request_data["p_xktjz"] == "rwtjzyx"
+    assert request_data["p_xkfsdm"] == "[[REAL_SPORTS_THREE_CODE]]"
+    assert request_data["p_kclb"] == "[[SPORTS_CATEGORY]]"
+    assert request_data["p_id"] == "[[COURSE_TASK_ID]]"
+
+
 def test_start_auto_selection_opens_rush_page_without_numeric_index(
     app_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

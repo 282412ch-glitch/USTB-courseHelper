@@ -311,7 +311,7 @@ def test_all_course_types_continue_after_failure_and_aggregate_results(
     shown: list[tuple[list[object], dict[str, str], int, dict[str, int]]] = []
     app.show_course_search_results = (
         lambda target_id, results, type_by_task_id, failed_count=0,
-        type_counts=None: shown.append(
+        type_counts=None, type_labels_by_code=None: shown.append(
             (
                 list(results),
                 dict(type_by_task_id),
@@ -327,7 +327,12 @@ def test_all_course_types_continue_after_failure_and_aggregate_results(
         "showerror",
         lambda title, message: errors.append(message),
     )
-    course_types = ["sztzk-b-b", "zytzk-b-b", "mooc-b-b", "bx-b-b"]
+    course_types = [
+        "sztzk-b-b",
+        "zytzk-b-b",
+        "mooc-b-b",
+        "bx-b-b",
+    ]
     payloads = [
         (course_type, {"p_xkfsdm": course_type})
         for course_type in course_types
@@ -353,6 +358,476 @@ def test_all_course_types_continue_after_failure_and_aggregate_results(
     }
     assert any("sztzk-b-b" in message for message in logs)
     assert errors == []
+
+
+def test_sports_query_uses_current_rule_code_for_query_and_result(
+    app_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证体育查询按官网顺序使用服务端学期和规则。
+
+    Args:
+        app_module: 已加载的课程助手入口模块。
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None: 通过断言验证学期、规则、任务查询和待抢数据保持一致。
+    """
+    real_sports_code = "[[REAL_SPORTS_THREE_CODE]]"
+    user_entered_semester = "2025-2026-2"
+    server_context = {
+        "p_xn": "2026-2027",
+        "p_xq": "1",
+        "p_xnxq": "2026-20271",
+        "p_dqxn": "2026-2027",
+        "p_dqxq": "1",
+        "p_dqxnxq": "2026-20271",
+        "cxsfmt": "1",
+    }
+    requested_calls: list[tuple[str, dict[str, str]]] = []
+
+    class FakeResponse:
+        """提供规则或课程查询响应。"""
+
+        def __init__(self, content: bytes) -> None:
+            """保存 JSON 响应内容。
+
+            Args:
+                content: 模拟 HTTP 响应字节。
+
+            Returns:
+                None: 内容保存在实例属性中。
+            """
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            """模拟成功 HTTP 响应。"""
+            return None
+
+    class FakeSession:
+        """记录规则和任务查询请求的会话替身。"""
+
+        def __init__(self) -> None:
+            """初始化 Cookie 和请求头容器。"""
+            self.cookies: dict[str, str] = {}
+            self.headers: dict[str, str] = {}
+
+        def post(
+            self,
+            url: str,
+            data: dict[str, str],
+            timeout: int,
+        ) -> FakeResponse:
+            """按官网调用顺序返回上下文、规则和体育课程结果。"""
+            requested_calls.append((url, dict(data)))
+            if url.endswith("/Xsxk/queryXkdqXnxq"):
+                return FakeResponse(
+                    app_module.orjson.dumps({"data": {"xsxkPage": server_context}})
+                )
+            if url.endswith("/Xsxk/queryYxkc"):
+                assert {
+                    field_name: data[field_name]
+                    for field_name in server_context
+                } == server_context
+                return FakeResponse(
+                    app_module.orjson.dumps(
+                        {
+                            "xkgzszList": [
+                                {
+                                    "xkfsmc": "体育Ⅲ",
+                                    "xkfsdm": real_sports_code,
+                                }
+                            ]
+                        }
+                    )
+                )
+            assert url.endswith("/Xsxk/queryKxrw")
+            assert data["p_xkfsdm"] == real_sports_code
+            assert {
+                field_name: data[field_name]
+                for field_name in server_context
+            } == server_context
+            return FakeResponse(
+                app_module.orjson.dumps(
+                    {
+                        "kxrwList": {
+                            "list": [
+                                {
+                                    "id": "[[SPORTS_TASK_ID]]",
+                                    "kclb": "[[LEGACY_CATEGORY]]",
+                                    "kclbdm": "[[SPORTS_CATEGORY]]",
+                                    "kcdm": "[[SPORTS_COURSE_CODE]]",
+                                    "kcmc": "[[SPORTS_COURSE_NAME]]",
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+
+    app, profile_id, _ = _make_app(app_module, tmp_path)
+    app.apply_active_user_control_state = lambda: None
+    app.user_log = lambda *args: None
+    shown: list[tuple[list[object], dict[str, str]]] = []
+    app.show_course_search_results = (
+        lambda target_id, results, type_by_task_id, failed_count=0,
+        type_counts=None, type_labels_by_code=None: shown.append(
+            (list(results), dict(type_by_task_id))
+        )
+    )
+    monkeypatch.setattr(app_module.requests, "Session", FakeSession)
+
+    criteria = app_module.CourseSearchCriteria(
+        course_code="[[SPORTS_COURSE_CODE]]",
+        course_name="",
+    )
+    app.query_course_results(
+        profile_id,
+        {"SESSION": "[[COOKIE_A]]"},
+        "体育III",
+        user_entered_semester,
+        criteria,
+        app_module.build_available_course_types_payload(user_entered_semester),
+    )
+
+    assert [url.rsplit("/", maxsplit=1)[-1] for url, _ in requested_calls] == [
+        "queryXkdqXnxq",
+        "queryYxkc",
+        "queryKxrw",
+    ]
+    assert requested_calls[1][1]["p_xkfsdm"] == "yixuan"
+    assert requested_calls[2][1]["p_xkfsdm"] == real_sports_code
+    assert requested_calls[1][1]["p_xnxq"] == server_context["p_xnxq"]
+    assert requested_calls[2][1]["p_xnxq"] == server_context["p_xnxq"]
+    assert requested_calls[2][1]["p_xnxq"] != "2025-20262"
+    assert shown[0][1] == {"[[SPORTS_TASK_ID]]": real_sports_code}
+    assert app.runtime.require_context(profile_id).search_type_labels_by_code[
+        real_sports_code
+    ] == "体育III"
+    assert shown[0][0][0].category_code == "[[SPORTS_CATEGORY]]"
+
+
+def test_missing_course_rule_list_keeps_server_diagnostic(
+    app_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证规则响应缺失 xkgzszList 时不会把服务端错误吞掉。"""
+    requested_endpoints: list[str] = []
+    server_context = {
+        "p_xn": "2026-2027",
+        "p_xq": "1",
+        "p_xnxq": "2026-20271",
+        "p_dqxn": "2026-2027",
+        "p_dqxq": "1",
+        "p_dqxnxq": "2026-20271",
+        "cxsfmt": "1",
+    }
+
+    class FakeResponse:
+        """提供上下文或不包含规则列表的服务端响应。"""
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            """序列化给定的 JSON 响应对象。"""
+            self.content = app_module.orjson.dumps(payload)
+
+        def raise_for_status(self) -> None:
+            """模拟成功 HTTP 响应。"""
+            return None
+
+    class FakeSession:
+        """记录请求端点并在规则请求中返回可诊断错误。"""
+
+        def __init__(self) -> None:
+            """初始化 Cookie 和请求头容器。"""
+            self.cookies: dict[str, str] = {}
+            self.headers: dict[str, str] = {}
+
+        def post(
+            self,
+            url: str,
+            data: dict[str, str],
+            timeout: int,
+        ) -> FakeResponse:
+            """返回对应端点的模拟响应。"""
+            requested_endpoints.append(url.rsplit("/", maxsplit=1)[-1])
+            if url.endswith("/Xsxk/queryXkdqXnxq"):
+                return FakeResponse({"data": {"xsxkPage": server_context}})
+            assert url.endswith("/Xsxk/queryYxkc")
+            return FakeResponse(
+                {
+                    "code": "[[RULES_RESPONSE_CODE]]",
+                    "message": "[[RULES_DIAGNOSTIC]]",
+                }
+            )
+
+    app, profile_id, _ = _make_app(app_module, tmp_path)
+    app.apply_active_user_control_state = lambda: None
+    app.user_log = lambda *args: None
+    errors: list[str] = []
+    monkeypatch.setattr(app_module.requests, "Session", FakeSession)
+    monkeypatch.setattr(
+        app_module.messagebox,
+        "showerror",
+        lambda title, message: errors.append(message),
+    )
+
+    app.query_course_results(
+        profile_id,
+        {"SESSION": "[[COOKIE_A]]"},
+        "体育III",
+        "2025-2026-2",
+        app_module.CourseSearchCriteria("[[SPORTS_COURSE_CODE]]", ""),
+        app_module.build_available_course_types_payload("2025-2026-2"),
+    )
+
+    assert requested_endpoints == ["queryXkdqXnxq", "queryYxkc"]
+    assert len(errors) == 1
+    assert "xkgzszList" in errors[0]
+    assert "[[RULES_DIAGNOSTIC]]" in errors[0]
+
+
+def test_missing_course_task_list_keeps_server_diagnostic(
+    app_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证课程接口错误包不会被误当作空查询结果。"""
+    server_context = {
+        "p_xn": "2026-2027",
+        "p_xq": "1",
+        "p_xnxq": "2026-20271",
+        "p_dqxn": "2026-2027",
+        "p_dqxq": "1",
+        "p_dqxnxq": "2026-20271",
+        "cxsfmt": "1",
+    }
+
+    class FakeResponse:
+        """提供学期、规则和课程错误包的响应替身。"""
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            """序列化给定响应对象。"""
+            self.content = app_module.orjson.dumps(payload)
+
+        def raise_for_status(self) -> None:
+            """模拟成功 HTTP 状态。"""
+            return None
+
+    class FakeSession:
+        """在课程查询时返回包含服务端诊断的错误包。"""
+
+        def __init__(self) -> None:
+            """初始化 Cookie 和请求头容器。"""
+            self.cookies: dict[str, str] = {}
+            self.headers: dict[str, str] = {}
+
+        def post(
+            self,
+            url: str,
+            data: dict[str, str],
+            timeout: int,
+        ) -> FakeResponse:
+            """根据端点返回最小响应。"""
+            if url.endswith("/Xsxk/queryXkdqXnxq"):
+                return FakeResponse({"data": {"xsxkPage": server_context}})
+            if url.endswith("/Xsxk/queryYxkc"):
+                return FakeResponse(
+                    {
+                        "xkgzszList": [
+                            {"xkfsmc": "体育III", "xkfsdm": "[[SPORTS_CODE]]"}
+                        ]
+                    }
+                )
+            return FakeResponse(
+                {"message": "[[TASKS_DIAGNOSTIC]]", "jg": "-1"}
+            )
+
+    app, profile_id, _ = _make_app(app_module, tmp_path)
+    app.apply_active_user_control_state = lambda: None
+    app.user_log = lambda *args: None
+    errors: list[str] = []
+    monkeypatch.setattr(app_module.requests, "Session", FakeSession)
+    monkeypatch.setattr(
+        app_module.messagebox,
+        "showerror",
+        lambda title, message: errors.append(message),
+    )
+
+    app.query_course_results(
+        profile_id,
+        {"SESSION": "[[COOKIE_A]]"},
+        "体育III",
+        "2026-2027-1",
+        app_module.CourseSearchCriteria("[[SPORTS_COURSE_CODE]]", ""),
+        app_module.build_available_course_types_payload("2026-2027-1"),
+    )
+
+    assert len(errors) == 1
+    assert "kxrwList" in errors[0]
+    assert "[[TASKS_DIAGNOSTIC]]" in errors[0]
+
+
+def test_unavailable_sports_rule_lists_currently_available_sports(
+    app_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """验证缺少所选体育规则时提示当前账号可用的体育类型。
+
+    Args:
+        app_module: 已加载的课程助手入口模块。
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None: 通过断言验证错误提示包含标准体育类型名称。
+    """
+    app, _, _ = _make_app(app_module, tmp_path)
+
+    with pytest.raises(ValueError) as error:
+        app.build_course_query_payloads(
+            "体育I",
+            "2026-2027-1",
+            app_module.CourseSearchCriteria("[[COURSE_CODE]]", ""),
+            {"体育Ⅲ": "[[SPORTS_THREE_CODE]]"},
+        )
+
+    assert str(error.value) == (
+        "当前账号在 2026-2027-1 没有“体育I”选课规则；"
+        "可用体育类型：体育III"
+    )
+
+
+def test_course_type_summary_uses_dynamic_sports_display_label(
+    app_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """验证汇总文本展示体育名称而非服务端动态代码。
+
+    Args:
+        app_module: 已加载的课程助手入口模块。
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None: 通过断言验证动态体育代码会格式化为体育 III。
+    """
+    app, _, _ = _make_app(app_module, tmp_path)
+    dynamic_sports_code = "[[SPORTS_THREE_CODE]]"
+    labels_by_code = app.build_course_type_labels_by_code(
+        {"体育Ⅲ": dynamic_sports_code}
+    )
+
+    summary = app.format_course_type_summary(
+        {dynamic_sports_code: 6, "bx-b-b": 1},
+        labels_by_code,
+    )
+
+    assert summary == "体育III 6 / 必修课 1"
+
+
+def test_all_course_query_includes_dynamic_sports_rules(
+    app_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证“所有”会把规则接口返回的体育代码加入任务查询。
+
+    Args:
+        app_module: 已加载的课程助手入口模块。
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None: 通过断言验证三个体育规则均会被真实代码请求。
+    """
+    sports_codes = {
+        "体育I": "[[SPORTS_ONE_CODE]]",
+        "体育II": "[[SPORTS_TWO_CODE]]",
+        "体育III": "[[SPORTS_THREE_CODE]]",
+    }
+    server_context = {
+        "p_xn": "2026-2027",
+        "p_xq": "1",
+        "p_xnxq": "2026-20271",
+        "p_dqxn": "2026-2027",
+        "p_dqxq": "1",
+        "p_dqxnxq": "2026-20271",
+        "cxsfmt": "1",
+    }
+    task_request_codes: list[str] = []
+
+    class FakeResponse:
+        """提供规则或空课程列表响应。"""
+
+        def __init__(self, content: bytes) -> None:
+            """保存 JSON 响应内容。"""
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            """模拟成功 HTTP 状态。"""
+            return None
+
+    class FakeSession:
+        """按端点返回规则或空课程结果。"""
+
+        def __init__(self) -> None:
+            """初始化 Cookie 和请求头容器。"""
+            self.cookies: dict[str, str] = {}
+            self.headers: dict[str, str] = {}
+
+        def post(
+            self,
+            url: str,
+            data: dict[str, str],
+            timeout: int,
+        ) -> FakeResponse:
+            """记录任务查询代码并返回对应模拟响应。"""
+            if url.endswith("/Xsxk/queryXkdqXnxq"):
+                return FakeResponse(
+                    app_module.orjson.dumps({"data": {"xsxkPage": server_context}})
+                )
+            if url.endswith("/Xsxk/queryYxkc"):
+                rules = [
+                    {"xkfsmc": label, "xkfsdm": code}
+                    for label, code in {
+                        "素质扩展课": "sztzk-b-b",
+                        "专业扩展课": "zytzk-b-b",
+                        "MOOC": "mooc-b-b",
+                        "必修课": "bx-b-b",
+                        **sports_codes,
+                    }.items()
+                ]
+                return FakeResponse(
+                    app_module.orjson.dumps({"xkgzszList": rules})
+                )
+            task_request_codes.append(data["p_xkfsdm"])
+            return FakeResponse(
+                app_module.orjson.dumps({"kxrwList": {"list": []}})
+            )
+
+    app, profile_id, _ = _make_app(app_module, tmp_path)
+    app.apply_active_user_control_state = lambda: None
+    app.user_log = lambda *args: None
+    app.show_course_search_results = lambda *args: None
+    monkeypatch.setattr(app_module.requests, "Session", FakeSession)
+
+    app.query_course_results(
+        profile_id,
+        {"SESSION": "[[COOKIE_A]]"},
+        "所有",
+        "2026-2027-1",
+        app_module.CourseSearchCriteria("[[COURSE_CODE]]", ""),
+        app_module.build_available_course_types_payload("2026-2027-1"),
+    )
+
+    assert task_request_codes == [
+        "sztzk-b-b",
+        "zytzk-b-b",
+        "mooc-b-b",
+        "bx-b-b",
+        *sports_codes.values(),
+    ]
 
 
 def test_course_type_query_fetches_later_pages(
@@ -458,7 +933,7 @@ def test_course_type_query_fetches_later_pages(
     shown: list[list[object]] = []
     app.show_course_search_results = (
         lambda target_id, results, type_by_task_id, failed_count=0,
-        type_counts=None: shown.append(list(results))
+        type_counts=None, type_labels_by_code=None: shown.append(list(results))
     )
     monkeypatch.setattr(app_module.requests, "Session", FakeSession)
 
@@ -645,6 +1120,16 @@ def test_selection_worker_records_course_response_in_runtime(
     [
         ("不在设定的选课时间范围内", "不在设定的选课时间范围内"),
         ("选课成功", "选课成功"),
+        (
+            '{"gjhczztm":"OPERATE.RESULT_SUCCESS",'
+            '"message":"操作成功","jg":"1"}',
+            "选课成功",
+        ),
+        (
+            '{"gjhczztm":"XKGL.OPERATE.RESULT_GRWYXDYXRWZ",'
+            '"message":"该任务已选择，课程：体育III","jg":"-1"}',
+            "选课成功",
+        ),
         ("课程容量已满", "课程容量已满"),
         ("不符合选课要求", "不符合选课要求"),
         (

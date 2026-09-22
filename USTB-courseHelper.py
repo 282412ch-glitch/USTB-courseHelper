@@ -21,11 +21,20 @@ from browser_driver import (
     is_qr_login_expired,
 )
 from course_query import (
+    COURSE_TYPE_CODES,
+    COURSE_TYPE_LABELS,
+    SPORTS_COURSE_TYPE_LABELS,
     DISPLAY_COLUMNS,
     CourseSearchCriteria,
     CourseSearchResult,
+    build_academic_context_payload,
+    build_available_course_types_payload,
     build_course_query_payload,
+    enrich_course_query_payload,
+    extract_academic_context,
+    extract_available_course_type_codes,
     extract_course_search_results,
+    resolve_available_course_type_code,
 )
 from rush_schedule import get_scheduled_start
 from rush_list_store import RushListStore, RushListStoreError, SavedRushList
@@ -54,6 +63,13 @@ stop_selection = False     # 是否请求停止
 online_thread_running = False  # 是否正在运行online线程gio
 
 SELECTION_RESULT_CODE_STATUSES: dict[str, str] = {
+    # The selection endpoint returns this code, rather than a message that
+    # literally includes "选课成功", for a successful direct submission.
+    "OPERATE.RESULT_SUCCESS": "选课成功",
+    # Subsequent submissions of the same task are idempotently rejected as
+    # already selected.  Treat that terminal confirmation as success too, so
+    # a stale retry loop cannot keep hitting the server.
+    "XKGL.OPERATE.RESULT_GRWYXDYXRWZ": "选课成功",
     "XKGL.OPERATE.RESULT_YCGDWRL": "课程容量已满",
     "XKGL.OPERATE.RESULT_YCGZRL": "课程容量已满",
     "XKGL.OPERATE.RESULT_XKSJCTDQRWHCTRWH": "不符合选课要求",
@@ -68,6 +84,17 @@ SELECTION_MESSAGE_STATUSES: tuple[tuple[str, str], ...] = (
     ("容量已满", "课程容量已满"),
     ("上课时间冲突", "不符合选课要求"),
 )
+
+# The course-query endpoint returns HTTP 200 with a business error when its
+# per-session request rate is exceeded.  Keep retries bounded and only apply
+# the delay to that explicit response so normal queries stay responsive.
+COURSE_QUERY_RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "查询请求频率过高",
+    "请求频率过高",
+    "操作过于频繁",
+)
+COURSE_QUERY_RATE_RETRY_LIMIT = 3
+COURSE_QUERY_RATE_BACKOFF_SECONDS = 2.0
 
 
 def classify_selection_response(response_text: str) -> str:
@@ -1589,7 +1616,7 @@ class CourseSelectionApp:
         self.root.destroy()
 
     def configure_browser(self: "CourseSelectionApp") -> None:
-        """配置后台预热和扫码登录共用的 Chrome 启动选项。
+        """分别配置后台预热和扫码登录使用的 Chrome 启动选项。
 
         Args:
             self: 当前课程助手应用实例。
@@ -1598,11 +1625,16 @@ class CourseSelectionApp:
             None: Chrome 选项保存在当前应用实例中。
         """
         self.chrome_options = Options()
-        self.chrome_options.add_argument("--headless=new")
         self.chrome_options.add_argument("--disable-gpu")
         self.chrome_options.add_argument("--no-sandbox")
         self.chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        self.chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        self.chrome_warmup_options = Options()
+        self.chrome_warmup_options.add_argument("--headless=new")
+        self.chrome_warmup_options.add_argument("--disable-gpu")
+        self.chrome_warmup_options.add_argument("--no-sandbox")
+        self.chrome_warmup_options.add_argument(
+            "--disable-blink-features=AutomationControlled"
+        )
 
     def start_browser_driver_warmup(self: "CourseSelectionApp") -> None:
         """在应用启动时并行预匹配 ChromeDriver。
@@ -1629,7 +1661,7 @@ class CourseSelectionApp:
             None: 预热结果保存在 ChromeDriverWarmup 中。
         """
         print("正在后台匹配 ChromeDriver，程序界面可继续使用...")
-        self.browser_driver_warmup.run(self.chrome_options)
+        self.browser_driver_warmup.run(self.chrome_warmup_options)
         try:
             self.browser_driver_warmup.wait()
         except RuntimeError as error:
@@ -2165,7 +2197,7 @@ class CourseSelectionApp:
         self.course_type_combo = ttk.Combobox(
             input_frame,
             textvariable=self.course_type_var,
-            values=["所有", "素质扩展课", "专业扩展课", "MOOC", "必修课"],
+            values=["所有", *COURSE_TYPE_LABELS],
             state="readonly",
             width=16,
         )
@@ -2199,7 +2231,11 @@ class CourseSelectionApp:
 
         result_toolbar = ttk.Frame(result_frame, style="TFrame")
         result_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        result_toolbar.columnconfigure(0, weight=1)
+        # Keep the actionable controls near the left edge.  The result table
+        # has a deliberately wide horizontal scroll area; letting its width
+        # stretch this toolbar would push "添加选中课程" off-screen on high-DPI
+        # displays.
+        result_toolbar.columnconfigure(0, weight=0)
         self.search_count_var = tk.StringVar(value="尚未查询")
         self.search_type_summary_var = tk.StringVar(value="")
         ttk.Label(
@@ -3669,14 +3705,8 @@ class CourseSelectionApp:
             messagebox.showerror("错误", "请先登录")
             return
 
-        course_type_codes = {
-            "素质扩展课": "sztzk-b-b",
-            "专业扩展课": "zytzk-b-b",
-            "MOOC": "mooc-b-b",
-            "必修课": "bx-b-b",
-        }
         selected_course_type = self.course_type_var.get()
-        if selected_course_type not in {"所有", *course_type_codes}:
+        if selected_course_type not in {"所有", *COURSE_TYPE_LABELS}:
             messagebox.showerror("错误", "课程类型无效")
             return
 
@@ -3685,22 +3715,8 @@ class CourseSelectionApp:
             course_name=self.course_name_var.get().strip(),
         )
         try:
-            target_course_types = (
-                course_type_codes.items()
-                if selected_course_type == "所有"
-                else ((selected_course_type, course_type_codes[selected_course_type]),)
-            )
-            payloads = [
-                (
-                    course_type_code,
-                    build_course_query_payload(
-                        semester=self.semester_var.get().strip(),
-                        course_type_code=course_type_code,
-                        criteria=criteria,
-                    ),
-                )
-                for _, course_type_code in target_course_types
-            ]
+            semester = self.semester_var.get().strip()
+            rule_payload = build_available_course_types_payload(semester)
         except ValueError as error:
             messagebox.showerror("错误", str(error))
             return
@@ -3709,15 +3725,266 @@ class CourseSelectionApp:
         self.status_var.set("正在查询课程...")
         threading.Thread(
             target=self.query_course_results,
-            args=(context.profile.id, cookies, payloads),
+            args=(
+                context.profile.id,
+                cookies,
+                selected_course_type,
+                semester,
+                criteria,
+                rule_payload,
+            ),
             daemon=True,
         ).start()
+
+    def query_available_course_type_codes(
+        self: "CourseSelectionApp",
+        session: requests.Session,
+        rule_payload: dict[str, str],
+    ) -> dict[str, str]:
+        """读取当前登录用户在指定学期可用的选课方式规则。
+
+        Args:
+            self: 当前课程助手应用实例。
+            session: 已带有当前用户 Cookie 和请求头的 HTTP 会话。
+            rule_payload: `Xsxk/queryYxkc` 所需的查询参数。
+
+        Returns:
+            课程类型名称到服务端实际选课方式代码的映射。
+
+        Raises:
+            RuntimeError: 服务端未返回可解析的规则对象时抛出。
+            requests.RequestException: 请求规则接口失败时向上抛出。
+        """
+        response = session.post(
+            "https://byyt.ustb.edu.cn/Xsxk/queryYxkc",
+            data=rule_payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        response_payload = orjson.loads(response.content)
+        if not isinstance(response_payload, dict):
+            raise RuntimeError("选课规则接口返回格式无效")
+        course_type_codes = extract_available_course_type_codes(response_payload)
+        if not course_type_codes:
+            message = response_payload.get("message")
+            detail = message.strip() if isinstance(message, str) else ""
+            suffix = f"：{detail}" if detail else ""
+            raise RuntimeError(
+                f"选课规则接口未返回 xkgzszList 可用规则{suffix}"
+            )
+        return course_type_codes
+
+    def query_academic_context(
+        self: "CourseSelectionApp",
+        session: requests.Session,
+    ) -> dict[str, str]:
+        """读取教务系统当前开放选课学期的服务端上下文。
+
+        Args:
+            self: 当前课程助手应用实例。
+            session: 已带有当前用户 Cookie 和请求头的 HTTP 会话。
+
+        Returns:
+            可覆盖后续规则和课程请求的学期上下文字段。
+
+        Raises:
+            RuntimeError: 响应缺少可用学期上下文时抛出。
+            requests.RequestException: 请求上下文接口失败时向上抛出。
+        """
+        response = session.post(
+            "https://byyt.ustb.edu.cn/Xsxk/queryXkdqXnxq",
+            data=build_academic_context_payload(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        response_payload = orjson.loads(response.content)
+        if not isinstance(response_payload, dict):
+            raise RuntimeError("选课学期接口返回格式无效")
+        academic_context = extract_academic_context(response_payload)
+        if not academic_context:
+            message = response_payload.get("message")
+            detail = message.strip() if isinstance(message, str) else ""
+            suffix = f"：{detail}" if detail else ""
+            raise RuntimeError(f"选课学期接口未返回当前学期{suffix}")
+        return academic_context
+
+    def build_rule_payload_from_academic_context(
+        self: "CourseSelectionApp",
+        academic_context: dict[str, str],
+    ) -> dict[str, str]:
+        """按官网规则页状态构造当前账号的可用选课方式请求。
+
+        Args:
+            self: 当前课程助手应用实例。
+            academic_context: 服务端返回的学期上下文。
+
+        Returns:
+            含 ``yixuan`` 选项卡和完整筛选字段的规则查询参数。
+        """
+        payload = build_academic_context_payload()
+        payload.update(academic_context)
+        payload.update({"p_xkfsdm": "yixuan", "p_kclb": ""})
+        return payload
+
+    def build_course_query_payloads(
+        self: "CourseSelectionApp",
+        selected_course_type: str,
+        semester: str,
+        criteria: CourseSearchCriteria,
+        available_course_type_codes: dict[str, str],
+        academic_context: dict[str, str] | None = None,
+    ) -> list[tuple[str, dict[str, str]]]:
+        """根据当前账号规则构造每个课程类型的任务查询请求。
+
+        普通课程类型保留稳定的兼容代码作为兜底；体育课程只接受
+        `queryYxkc` 返回的实际代码，以保证查询和后续抢课使用同一规则。
+
+        Args:
+            self: 当前课程助手应用实例。
+            selected_course_type: 界面选择的课程类型或“所有”。
+            semester: `YYYY-YYYY-N` 格式的学年学期。
+            criteria: 用户填写的课程筛选条件。
+            available_course_type_codes: 当前用户可用的服务端规则映射。
+            academic_context: 服务端返回的学期上下文，会覆盖界面输入学期。
+
+        Returns:
+            选课方式代码与对应任务查询参数的列表。
+
+        Raises:
+            ValueError: 指定体育课程当前没有可用规则时抛出。
+        """
+        selected_labels = (
+            COURSE_TYPE_LABELS
+            if selected_course_type == "所有"
+            else (selected_course_type,)
+        )
+        payloads: list[tuple[str, dict[str, str]]] = []
+        used_course_type_codes: set[str] = set()
+        for course_type_label in selected_labels:
+            rule_course_type_code = resolve_available_course_type_code(
+                course_type_label,
+                available_course_type_codes,
+            )
+            course_type_code = rule_course_type_code or COURSE_TYPE_CODES.get(
+                course_type_label
+            )
+            if course_type_code is None:
+                if selected_course_type == "所有":
+                    continue
+                available_sports = self.available_sports_course_type_labels(
+                    available_course_type_codes
+                )
+                available_sports_text = "、".join(available_sports) or "无"
+                raise ValueError(
+                    f"当前账号在 {semester} 没有“{course_type_label}”选课规则；"
+                    f"可用体育类型：{available_sports_text}"
+                )
+            if course_type_code in used_course_type_codes:
+                continue
+            used_course_type_codes.add(course_type_code)
+            payload = enrich_course_query_payload(
+                build_course_query_payload(
+                    semester=semester,
+                    course_type_code=course_type_code,
+                    criteria=criteria,
+                )
+            )
+            if academic_context:
+                payload.update(academic_context)
+            payload["p_xktjz"] = ""
+            payloads.append(
+                (
+                    course_type_code,
+                    payload,
+                )
+            )
+        if not payloads:
+            raise ValueError("当前账号没有可查询的课程类型")
+        return payloads
+
+    def available_sports_course_type_labels(
+        self: "CourseSelectionApp",
+        available_course_type_codes: dict[str, str],
+    ) -> tuple[str, ...]:
+        """返回当前账号规则中可用体育课程的标准展示名称。
+
+        Args:
+            self: 当前课程助手应用实例。
+            available_course_type_codes: 当前用户可用的服务端规则映射。
+
+        Returns:
+            按界面顺序排列的体育 I/II/III 名称元组。
+        """
+        return tuple(
+            course_type_label
+            for course_type_label in SPORTS_COURSE_TYPE_LABELS
+            if resolve_available_course_type_code(
+                course_type_label,
+                available_course_type_codes,
+            )
+            is not None
+        )
+
+    def build_course_type_labels_by_code(
+        self: "CourseSelectionApp",
+        available_course_type_codes: dict[str, str],
+    ) -> dict[str, str]:
+        """构造用于课程结果汇总的选课方式代码展示名称映射。
+
+        Args:
+            self: 当前课程助手应用实例。
+            available_course_type_codes: 当前用户可用的服务端规则映射。
+
+        Returns:
+            选课方式代码到界面课程类型名称的映射。
+        """
+        labels_by_code = {
+            course_type_code: course_type_label
+            for course_type_label, course_type_code in COURSE_TYPE_CODES.items()
+        }
+        for course_type_label in COURSE_TYPE_LABELS:
+            course_type_code = resolve_available_course_type_code(
+                course_type_label,
+                available_course_type_codes,
+            )
+            if course_type_code is not None:
+                labels_by_code[course_type_code] = course_type_label
+        return labels_by_code
+
+    def format_course_type_summary(
+        self: "CourseSelectionApp",
+        course_type_counts: dict[str, int],
+        course_type_labels_by_code: dict[str, str] | None = None,
+    ) -> str:
+        """将课程类型统计格式化为用户可见的汇总文本。
+
+        Args:
+            self: 当前课程助手应用实例。
+            course_type_counts: 每个选课方式代码对应的课程数量。
+            course_type_labels_by_code: 可选的动态选课方式展示名称映射。
+
+        Returns:
+            以斜杠分隔的课程类型及数量文本。
+        """
+        type_labels = {
+            course_type_code: course_type_label
+            for course_type_label, course_type_code in COURSE_TYPE_CODES.items()
+        }
+        if course_type_labels_by_code is not None:
+            type_labels.update(course_type_labels_by_code)
+        return " / ".join(
+            f"{type_labels.get(course_type_code, course_type_code)} {count}"
+            for course_type_code, count in course_type_counts.items()
+        )
 
     def query_course_results(
         self: "CourseSelectionApp",
         profile_id: str,
         cookies: dict[str, str],
-        payloads: list[tuple[str, dict[str, str]]],
+        selected_course_type: str | list[tuple[str, dict[str, str]]],
+        semester: str | None = None,
+        criteria: CourseSearchCriteria | None = None,
+        rule_payload: dict[str, str] | None = None,
     ) -> None:
         """
         使用当前登录会话请求课程结果并安排界面刷新。
@@ -3726,7 +3993,11 @@ class CourseSelectionApp:
             self: 当前课程助手应用实例。
             profile_id: 发起查询的用户 UUID。
             cookies: 查询开始时捕获的用户 Cookie 副本。
-            payloads: 选课方式代码与其对应的非空查询参数列表。
+            selected_course_type: 界面选中的课程类型；旧测试传入请求列表时兼容
+                既有查询行为。
+            semester: 需要查询的学年学期。
+            criteria: 课程代码和名称筛选条件。
+            rule_payload: 请求可用选课规则所需的参数。
 
         Returns:
             None: 结果或错误信息通过 Tkinter 主线程展示。
@@ -3751,9 +4022,69 @@ class CourseSelectionApp:
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
             })
+            if isinstance(selected_course_type, list):
+                payloads = selected_course_type
+                course_type_labels_by_code = {
+                    course_type_code: course_type_label
+                    for course_type_label, course_type_code in COURSE_TYPE_CODES.items()
+                }
+            else:
+                if semester is None or criteria is None or rule_payload is None:
+                    raise ValueError("课程查询缺少学期或筛选条件")
+                # The server, not the local clock, decides which term is open.
+                # Reuse this exact context for the rule lookup, task lookup, and
+                # the data later saved for the rush request.
+                academic_context = self.query_academic_context(session)
+                server_semester = (
+                    f"{academic_context['p_xn']}-{academic_context['p_xq']}"
+                )
+                rule_payload = self.build_rule_payload_from_academic_context(
+                    academic_context
+                )
+                try:
+                    available_course_type_codes = (
+                        self.query_available_course_type_codes(
+                            session,
+                            rule_payload,
+                        )
+                    )
+                except Exception as error:
+                    if selected_course_type in {"体育I", "体育II", "体育III"}:
+                        raise RuntimeError(
+                            f"无法读取当前账号的体育选课规则：{error}"
+                        ) from error
+                    available_course_type_codes = {}
+                    self.user_log(
+                        profile_id,
+                        f"读取选课规则失败，将只查询常规课程类型：{error}",
+                    )
+                payloads = self.build_course_query_payloads(
+                    selected_course_type,
+                    server_semester,
+                    criteria,
+                    available_course_type_codes,
+                    academic_context,
+                )
+                course_type_labels_by_code = self.build_course_type_labels_by_code(
+                    available_course_type_codes
+                )
+
+                def apply_server_semester() -> None:
+                    """Keep the add-to-rush form aligned with this query."""
+                    active_context = self.runtime.active_context()
+                    if (
+                        active_context is not None
+                        and active_context.profile.id == profile_id
+                        and hasattr(self, "semester_var")
+                    ):
+                        self.semester_var.set(server_semester)
+
+                self.root.after(0, apply_server_semester)
+
             result_by_task_id: dict[str, CourseSearchResult] = {}
             course_type_by_task_id: dict[str, str] = {}
             failed_type_codes: list[str] = []
+            failed_type_errors: dict[str, str] = {}
             successful_type_count = 0
             course_type_counts = {
                 course_type_code: 0 for course_type_code, _ in payloads
@@ -3763,6 +4094,7 @@ class CourseSelectionApp:
                 page_number = 1
                 type_task_ids: set[str] = set()
                 type_had_success = False
+                rate_limit_attempts = 0
                 while page_number <= 100:
                     page_payload = dict(payload)
                     page_payload["pageNum"] = str(page_number)
@@ -3774,11 +4106,49 @@ class CourseSelectionApp:
                             timeout=30,
                         )
                         response.raise_for_status()
+                        response_payload = orjson.loads(response.content)
+                        if not isinstance(response_payload, dict):
+                            raise RuntimeError("课程任务接口返回格式无效")
+                        task_list = response_payload.get("kxrwList")
+                        if (
+                            not isinstance(task_list, dict)
+                            or not isinstance(task_list.get("list"), list)
+                        ):
+                            message = response_payload.get("message")
+                            detail = (
+                                message.strip()
+                                if isinstance(message, str)
+                                else ""
+                            )
+                            if any(
+                                marker in detail
+                                for marker in COURSE_QUERY_RATE_LIMIT_MARKERS
+                            ):
+                                rate_limit_attempts += 1
+                                if rate_limit_attempts <= COURSE_QUERY_RATE_RETRY_LIMIT:
+                                    delay = (
+                                        COURSE_QUERY_RATE_BACKOFF_SECONDS
+                                        * rate_limit_attempts
+                                    )
+                                    self.user_log(
+                                        profile_id,
+                                        f"课程类型 {course_type_code} 第 {page_number} 页触发查询限流，"
+                                        f"{delay:.1f} 秒后重试（{rate_limit_attempts}/"
+                                        f"{COURSE_QUERY_RATE_RETRY_LIMIT}）",
+                                    )
+                                    time.sleep(delay)
+                                    continue
+                            suffix = f"：{detail}" if detail else ""
+                            raise RuntimeError(
+                                f"课程任务接口未返回 kxrwList{suffix}"
+                            )
+                        rate_limit_attempts = 0
                         response_results = extract_course_search_results(
-                            orjson.loads(response.content)
+                            response_payload
                         )
                     except Exception as error:
                         failed_type_codes.append(course_type_code)
+                        failed_type_errors.setdefault(course_type_code, str(error))
                         self.user_log(
                             profile_id,
                             f"课程类型 {course_type_code} 第 {page_number} 页查询失败：{error}",
@@ -3803,10 +4173,27 @@ class CourseSelectionApp:
                 if type_had_success:
                     successful_type_count += 1
                 course_type_counts[course_type_code] = len(type_task_ids)
+                if course_type_code != payloads[-1][0]:
+                    time.sleep(0.5)
             if successful_type_count == 0:
                 failed_summary = "、".join(failed_type_codes)
-                raise RuntimeError(f"所有课程类型查询均失败：{failed_summary}")
+                details = "；".join(
+                    f"{course_type_code}：{failed_type_errors[course_type_code]}"
+                    for course_type_code in dict.fromkeys(failed_type_codes)
+                    if course_type_code in failed_type_errors
+                )
+                suffix = f"（{details}）" if details else ""
+                raise RuntimeError(f"所有课程类型查询均失败：{failed_summary}{suffix}")
             results = list(result_by_task_id.values())
+            context = self.runtime.require_context(profile_id)
+            context.search_type_labels_by_code = dict(course_type_labels_by_code)
+            context.search_academic_context = (
+                dict(academic_context)
+                if isinstance(selected_course_type, str)
+                else {}
+            )
+            # Keep the original five-argument callback contract for callers that
+            # replace show_course_search_results in tests or integrations.
             self.root.after(
                 0,
                 lambda: self.show_course_search_results(
@@ -3831,6 +4218,7 @@ class CourseSelectionApp:
         course_type_by_task_id: dict[str, str],
         failed_type_count: int = 0,
         course_type_counts: dict[str, int] | None = None,
+        course_type_labels_by_code: dict[str, str] | None = None,
     ) -> None:
         """
         清空并填充课程查询结果表。
@@ -3842,6 +4230,7 @@ class CourseSelectionApp:
             course_type_by_task_id: 每条结果对应的选课方式代码。
             failed_type_count: 本次汇总中请求失败的课程类型数量。
             course_type_counts: 每种选课方式在去重前返回的课程数量。
+            course_type_labels_by_code: 动态选课方式代码对应的展示名称映射。
 
         Returns:
             None: 结果直接渲染到 Treeview 控件。
@@ -3851,6 +4240,12 @@ class CourseSelectionApp:
             result.task_id: result for result in results
         }
         context.search_result_course_types_by_task_id = dict(course_type_by_task_id)
+        if course_type_labels_by_code is None:
+            course_type_labels_by_code = getattr(
+                context,
+                "search_type_labels_by_code",
+                None,
+            )
         if self.current_profile_id() != profile_id:
             result_message = f"查询完成，共 {len(results)} 门课程"
             if failed_type_count:
@@ -3868,17 +4263,12 @@ class CourseSelectionApp:
         if course_type_counts is not None and hasattr(
             self, "search_type_summary_var"
         ):
-            type_labels = {
-                "sztzk-b-b": "素质扩展课",
-                "zytzk-b-b": "专业扩展课",
-                "mooc-b-b": "MOOC",
-                "bx-b-b": "必修课",
-            }
-            summary_parts = [
-                f"{type_labels.get(code, code)} {count}"
-                for code, count in course_type_counts.items()
-            ]
-            self.search_type_summary_var.set(" / ".join(summary_parts))
+            self.search_type_summary_var.set(
+                self.format_course_type_summary(
+                    course_type_counts,
+                    course_type_labels_by_code,
+                )
+            )
         if failed_type_count:
             self.search_count_var.set(
                 f"共汇总 {len(results)} 门课程（{failed_type_count} 个类型查询失败）"
@@ -3947,14 +4337,45 @@ class CourseSelectionApp:
             messagebox.showerror("错误", "优先级必须是整数")
             return
 
-        semester = self.semester_var.get().strip()
-        semester_parts = semester.split("-")
-        if len(semester_parts) != 3 or not all(semester_parts):
-            messagebox.showerror("错误", "学期格式错误，请使用 YYYY-YYYY-N 格式")
-            return
-
-        academic_year = "-".join(semester_parts[:2])
-        term = semester_parts[2]
+        academic_context = getattr(context, "search_academic_context", {})
+        academic_year = academic_context.get("p_xn", "")
+        term = academic_context.get("p_xq", "")
+        if not academic_year or not term:
+            semester = self.semester_var.get().strip()
+            semester_parts = semester.split("-")
+            if len(semester_parts) != 3 or not all(semester_parts):
+                messagebox.showerror("错误", "学期格式错误，请使用 YYYY-YYYY-N 格式")
+                return
+            academic_year = "-".join(semester_parts[:2])
+            term = semester_parts[2]
+        selection_context = {
+            field_name: academic_context[field_name]
+            for field_name in (
+                "p_xn",
+                "p_xq",
+                "p_xnxq",
+                "p_dqxn",
+                "p_dqxq",
+                "p_dqxnxq",
+                "cxsfmt",
+            )
+            if academic_context.get(field_name)
+        }
+        selection_context.update(
+            {
+                "p_xn": academic_year,
+                "p_xq": term,
+                "p_xnxq": selection_context.get(
+                    "p_xnxq", f"{academic_year}{term}"
+                ),
+                "p_dqxn": selection_context.get("p_dqxn", academic_year),
+                "p_dqxq": selection_context.get("p_dqxq", term),
+                "p_dqxnxq": selection_context.get(
+                    "p_dqxnxq", f"{academic_year}{term}"
+                ),
+                "cxsfmt": selection_context.get("cxsfmt", "1"),
+            }
+        )
         added_count = 0
         for task_id in selected_task_ids:
             result = self.search_results_by_task_id.get(task_id)
@@ -3966,16 +4387,18 @@ class CourseSelectionApp:
             ):
                 continue
             next_id = len(courses) + 1
-            courses.append({
-                "priority": priority,
-                "data": {
+            request_data = dict(selection_context)
+            request_data.update(
+                {
                     "p_xktjz": "rwtjzyx",
-                    "p_xn": academic_year,
-                    "p_xq": term,
                     "p_xkfsdm": course_type_code,
                     "p_kclb": result.category_code,
                     "p_id": result.task_id,
-                },
+                }
+            )
+            courses.append({
+                "priority": priority,
+                "data": request_data,
                 "name": result.course_name,
                 "teacher": result.teacher,
                 "course_id": result.course_code,
@@ -4017,15 +4440,8 @@ class CourseSelectionApp:
             return
 
         course_type_text = self.course_type_var.get()
-        if course_type_text == "素质扩展课":
-            p_xkfsdm = "sztzk-b-b"
-        elif course_type_text == "专业扩展课":
-            p_xkfsdm = "zytzk-b-b"
-        elif course_type_text == "MOOC":
-            p_xkfsdm = "mooc-b-b"
-        elif course_type_text == "必修课":
-            p_xkfsdm = "bx-b-b"
-        else:
+        p_xkfsdm = COURSE_TYPE_CODES.get(course_type_text)
+        if p_xkfsdm is None:
             messagebox.showerror("错误", "课程类型无效")
             return
 
